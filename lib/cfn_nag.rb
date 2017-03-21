@@ -50,29 +50,29 @@ class CfnNag
     RulesView.new.emit(@rule_registry, profile)
   end
 
-  def audit(input_json_path:,
+  def audit(input_file_path:,
             rule_directories: [],
             output_format:'txt')
     validate_extra_rule_directories(rule_directories)
 
-    aggregate_results = audit_results input_json_path: input_json_path,
+    aggregate_results = audit_results input_file_path: input_file_path,
                                       output_format: output_format,
                                       rule_directories: rule_directories.flatten
 
     aggregate_results.inject(0) { |total_failure_count, results| total_failure_count + results[:file_results][:failure_count] }
   end
 
-  def audit_results(input_json_path:,
+  def audit_results(input_file_path:,
                     output_format:'txt',
                     rule_directories: [])
 
-    templates = discover_templates(input_json_path)
+    templates = discover_templates(input_file_path)
 
     aggregate_results = []
     templates.each do |template|
       aggregate_results << {
           filename: template,
-          file_results: audit_file(input_json_path: template,
+          file_results: audit_file(input_file_path: template,
                                    rule_directories: rule_directories)
       }
     end
@@ -94,16 +94,33 @@ class CfnNag
     logger.add_appenders Logging.appenders.stdout
   end
 
-  def audit_template(input_json:,
+  def audit_template(input_file:,
                      rule_directories: [])
     @stop_processing = false
     @violations = []
 
-    unless legal_json?(input_json)
+    # Attempt to parse the input file as JSON
+    is_json, json_error = legal_json?(input_file)
+    input_json = input_file if is_json
+
+    # Input file isn't JSON, attempt parsing it as YAML
+    unless is_json
+      is_yaml, yaml_error = legal_yaml?(input_file) unless is_json
+      # Input file is YAML - convert it to JSON representation. Tool's major
+      # functionality is bound to JSON/jq heavily, thus reimplementing it in
+      # YAML-specific way would be a major rewrite.
+      input_json = YAML.load(input_file).to_json if is_yaml
+    end
+
+    # Report the fact input file is neither JSON or YAML along with
+    # corresponding parsing error, to make troubleshooting easier
+    unless is_yaml or is_json
       @violations << Violation.new(id: 'FATAL',
                                    type: Violation::FAILING_VIOLATION,
-                                   message: 'not even legit JSON',
-                                   violating_code: input_json)
+                                   message: 'not even legit JSON nor YAML',
+                                   violating_code: "Input: #{input_file}\n\n" \
+                                           "Parsing as JSON: #{json_error}\n" \
+                                           "Parsing as YAML: #{yaml_error}")
       @stop_processing = true
     end
 
@@ -144,25 +161,25 @@ class CfnNag
     results_renderer(output_format).new.render(aggregate_results)
   end
 
-  def audit_file(input_json_path:,
+  def audit_file(input_file_path:,
                  rule_directories:)
-    audit_template(input_json: IO.read(input_json_path),
+    audit_template(input_file: IO.read(input_file_path),
                    rule_directories: rule_directories)
   end
 
-  def discover_templates(input_json_path)
-    if ::File.directory? input_json_path
-      templates = find_templates_in_directory(directory: input_json_path)
-    elsif ::File.file? input_json_path
-      templates = [input_json_path.path]
+  def discover_templates(input_file_path)
+    if ::File.directory? input_file_path
+      templates = find_templates_in_directory(directory: input_file_path)
+    elsif ::File.file? input_file_path
+      templates = [input_file_path.path]
     else
-      fail "#{input_json_path} is not a proper path"
+      fail "#{input_file_path} is not a proper path"
     end
     templates
   end
 
   def find_templates_in_directory(directory:,
-                                  cfn_extensions: %w(json template))
+                                  cfn_extensions: %w(json yaml template))
 
     templates = []
     cfn_extensions.each do |cfn_extension|
@@ -182,9 +199,18 @@ class CfnNag
   def legal_json?(input_json)
     begin
       JSON.parse(input_json)
-      true
-    rescue JSON::ParserError
-      return false
+      [ true, nil ]
+    rescue JSON::ParserError => ex
+      return [ false, ex.message ]
+    end
+  end
+
+  def legal_yaml?(input_yaml)
+    begin
+      return false unless YAML.parse(input_yaml)
+      [ true, nil ]
+    rescue Psych::SyntaxError => ex
+      return [ false, ex.message ]
     end
   end
 
